@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import re
+import socket
 from datetime import datetime
 from flask import Flask, request, jsonify
 from google.cloud import pubsub_v1, firestore, storage
@@ -24,6 +26,42 @@ bucket = storage_client.bucket(os.environ.get('ARTIFACT_BUCKET'))
 # Topic paths
 recon_topic = publisher.topic_path(project_id, 'recon-hypotheses')
 
+def is_valid_target(target):
+    """
+    Validates that the target is a valid IP address or hostname.
+    Prevents command/argument injection into nmap.
+    """
+    if not target or len(target) > 255:
+        return False
+
+    # Check if it's a valid IP address (v4 or v6)
+    try:
+        socket.inet_aton(target)
+        return True
+    except socket.error:
+        pass
+
+    try:
+        socket.inet_pton(socket.AF_INET6, target)
+        return True
+    except socket.error:
+        pass
+
+    # Check if it's a valid hostname
+    # Hostnames can contain letters, numbers, hyphens, and dots.
+    # They must not start or end with a hyphen.
+    # Labels must be 1-63 characters.
+    hostname_regex = re.compile(
+        r"^"                             # Start of line
+        r"(?:[a-zA-Z0-9]"                # First character of a label
+        r"(?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*" # Middle labels
+        r"[a-zA-Z0-9]"                   # First character of last label
+        r"(?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?" # Last label
+        r"$"                             # End of line
+    )
+
+    return bool(hostname_regex.match(target))
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({"status": "healthy", "service": "recon-agent"}), 200
@@ -33,12 +71,20 @@ def scan_target():
     try:
         # Parse request
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
+
         target = data.get('target')
         scan_type = data.get('scan_type', 'basic')
         
         if not target:
             return jsonify({"error": "Target is required"}), 400
         
+        # 🛡️ Sentinel: Validate target to prevent injection
+        if not is_valid_target(target):
+            logger.warning(f"Invalid target attempt: {target}")
+            return jsonify({"error": "Invalid target format. Use a valid IP or hostname."}), 400
+
         logger.info(f"Starting recon scan for target: {target}")
         
         # Generate unique scan ID
@@ -124,8 +170,9 @@ def scan_target():
         }), 200
         
     except Exception as e:
-        logger.error(f"Error in recon scan: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        # 🛡️ Sentinel: Generic error message to prevent info leakage
+        logger.error(f"Error in recon scan: {str(e)}", exc_info=True)
+        return jsonify({"error": "An internal error occurred while processing the scan."}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
