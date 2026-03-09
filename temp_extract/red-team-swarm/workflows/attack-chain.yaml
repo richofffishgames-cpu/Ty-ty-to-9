@@ -1,0 +1,190 @@
+# Red Team Attack Chain Workflow
+# This workflow orchestrates the entire attack chain with human oversight
+
+main:
+  params: [target, scan_type]
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - workflow_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_ID")}
+          - start_time: ${time.format(sys.now())}
+
+    - log_workflow_start:
+        call: googleapis.firestore.v1.projects.databases.documents.createDocument
+        args:
+          parent: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions"}
+          documentId: ${workflow_id}
+          document:
+            fields:
+              workflow_id: { stringValue: ${workflow_id} }
+              target: { stringValue: ${target} }
+              scan_type: { stringValue: ${scan_type} }
+              status: { stringValue: "initiated" }
+              start_time: { timestampValue: ${start_time} }
+
+    - initiate_recon:
+        call: http.post
+        args:
+          url: ${recon_url}
+          auth:
+            type: OIDC
+          body:
+            target: ${target}
+            scan_type: ${scan_type}
+          timeout: 3600
+        result: recon_response
+
+    - log_recon_complete:
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions/" + workflow_id}
+          document:
+            fields:
+              recon_status: { stringValue: "completed" }
+              recon_response: { stringValue: ${json.encode_to_string(recon_response)} }
+              recon_timestamp: { timestampValue: ${time.format(sys.now())} }
+
+    - wait_for_validations:
+        call: events.await_callback
+        args:
+          callback:
+            name: validation_complete
+          timeout: 900  # 15 minutes
+        result: validation_callback
+
+    - process_validated_targets:
+        for:
+          value: target_info
+          in: ${validation_callback.validated_targets}
+          steps:
+            - log_validated_target:
+                call: googleapis.firestore.v1.projects.databases.documents.createDocument
+                args:
+                  parent: ${"projects/" + project_id + "/databases/(default)/documents/validated_targets"}
+                  document:
+                    fields:
+                      workflow_id: { stringValue: ${workflow_id} }
+                      target: { stringValue: ${target_info.target} }
+                      port: { integerValue: ${target_info.port} }
+                      service: { stringValue: ${target_info.service} }
+                      vulnerability: { stringValue: ${target_info.vulnerability} }
+                      validation_timestamp: { timestampValue: ${time.format(sys.now())} }
+
+    - wait_for_exploitation_results:
+        call: events.await_callback
+        args:
+          callback:
+            name: exploitation_complete
+          timeout: 1800  # 30 minutes
+        result: exploitation_callback
+
+    - check_foothold_status:
+        switch:
+          - condition: ${exploitation_callback.footholds_achieved > 0}
+            next: handle_successful_exploitation
+        next: handle_no_footholds
+
+    - handle_successful_exploitation:
+        steps:
+          - log_footholds:
+              call: googleapis.firestore.v1.projects.databases.documents.patch
+              args:
+                name: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions/" + workflow_id}
+                document:
+                  fields:
+                    footholds_achieved: { integerValue: ${exploitation_callback.footholds_achieved} }
+                    exploitation_timestamp: { timestampValue: ${time.format(sys.now())} }
+                    status: { stringValue: "foothold_achieved" }
+
+          - request_human_decision:
+              call: googleapis.pubsub.v1.projects.topics.publish
+              args:
+                topic: ${"projects/" + project_id + "/topics/human-decision-point"}
+                body:
+                  messages:
+                    - data: ${base64.encode(json.encode_to_string({
+                        workflow_id: workflow_id,
+                        type: "foothold_achieved",
+                        target: target,
+                        footholds: exploitation_callback.footholds,
+                        options: ["continue_lateral_movement", "gather_intelligence", "stop_engagement"],
+                        timestamp: time.format(sys.now())
+                      }))}
+
+          - await_human_decision:
+              call: events.await_callback
+              args:
+                callback:
+                  name: human_decision
+                timeout: 3600  # 1 hour for human decision
+              result: human_decision
+
+          - process_human_decision:
+              switch:
+                - condition: ${human_decision.decision == "continue_lateral_movement"}
+                  next: lateral_movement_phase
+                - condition: ${human_decision.decision == "gather_intelligence"}
+                  next: intelligence_gathering_phase
+                - condition: ${human_decision.decision == "stop_engagement"}
+                  next: cleanup_and_report
+              next: cleanup_and_report
+
+    - handle_no_footholds:
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions/" + workflow_id}
+          document:
+            fields:
+              status: { stringValue: "no_footholds_achieved" }
+              completion_timestamp: { timestampValue: ${time.format(sys.now())} }
+        next: cleanup_and_report
+
+    - lateral_movement_phase:
+        # This would trigger additional agents for lateral movement
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions/" + workflow_id}
+          document:
+            fields:
+              status: { stringValue: "lateral_movement_authorized" }
+              decision_timestamp: { timestampValue: ${time.format(sys.now())} }
+        next: cleanup_and_report
+
+    - intelligence_gathering_phase:
+        # This would trigger intelligence gathering agents
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions/" + workflow_id}
+          document:
+            fields:
+              status: { stringValue: "intelligence_gathering_authorized" }
+              decision_timestamp: { timestampValue: ${time.format(sys.now())} }
+        next: cleanup_and_report
+
+    - cleanup_and_report:
+        steps:
+          - finalize_workflow:
+              call: googleapis.firestore.v1.projects.databases.documents.patch
+              args:
+                name: ${"projects/" + project_id + "/databases/(default)/documents/workflow_executions/" + workflow_id}
+                document:
+                  fields:
+                    status: { stringValue: "completed" }
+                    end_time: { timestampValue: ${time.format(sys.now())} }
+
+          - generate_report:
+              call: http.post
+              args:
+                url: "https://your-report-generator-service"
+                body:
+                  workflow_id: ${workflow_id}
+                  target: ${target}
+                  completion_status: "workflow_completed"
+
+          - return_result:
+              return:
+                workflow_id: ${workflow_id}
+                target: ${target}
+                status: "completed"
+                timestamp: ${time.format(sys.now())}

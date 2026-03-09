@@ -14,65 +14,36 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Environment variables validation
-PROJECT_ID = os.environ.get('PROJECT_ID')
-ARTIFACT_BUCKET = os.environ.get('ARTIFACT_BUCKET')
+# Initialize GCP clients
+project_id = os.environ.get('PROJECT_ID')
+publisher = pubsub_v1.PublisherClient()
+db = firestore.Client()
+storage_client = storage.Client()
+bucket = storage_client.bucket(os.environ.get('ARTIFACT_BUCKET'))
 
-def get_gcp_clients():
-    """Initialize and return GCP clients if environment is configured"""
-    if not PROJECT_ID or not ARTIFACT_BUCKET:
-        logger.warning("GCP environment variables (PROJECT_ID, ARTIFACT_BUCKET) not fully set. "
-                       "Some features may fail.")
-
-    try:
-        publisher = pubsub_v1.PublisherClient()
-        db = firestore.Client(project=PROJECT_ID)
-        storage_client = storage.Client(project=PROJECT_ID)
-        bucket = storage_client.bucket(ARTIFACT_BUCKET) if ARTIFACT_BUCKET else None
-        return publisher, db, storage_client, bucket
-    except Exception as e:
-        logger.error(f"Failed to initialize GCP clients: {str(e)}")
-        return None, None, None, None
+# Topic paths
+recon_topic = publisher.topic_path(project_id, 'recon-hypotheses')
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({
-        "status": "healthy",
-        "service": "recon-agent",
-        "config": {
-            "project_id": PROJECT_ID,
-            "artifact_bucket": ARTIFACT_BUCKET
-        }
-    }), 200
+    return jsonify({"status": "healthy", "service": "recon-agent"}), 200
 
 @app.route('/', methods=['POST'])
 def scan_target():
     try:
         # Parse request
         data = request.get_json()
-        if not data:
-            return jsonify({"error": "Invalid JSON payload"}), 400
-
         target = data.get('target')
         scan_type = data.get('scan_type', 'basic')
-        
+
         if not target:
             return jsonify({"error": "Target is required"}), 400
-        
-        if not PROJECT_ID or not ARTIFACT_BUCKET:
-            return jsonify({"error": "Service misconfigured: missing PROJECT_ID or ARTIFACT_BUCKET"}), 500
-
-        publisher, db, storage_client, bucket = get_gcp_clients()
-        if not all([publisher, db, storage_client, bucket]):
-            return jsonify({"error": "Internal error: could not connect to GCP services"}), 500
-
-        recon_topic = publisher.topic_path(PROJECT_ID, 'recon-hypotheses')
 
         logger.info(f"Starting recon scan for target: {target}")
-        
+
         # Generate unique scan ID
         scan_id = str(uuid.uuid4())
-        
+
         # Log scan initiation
         scan_doc = {
             'scan_id': scan_id,
@@ -83,7 +54,7 @@ def scan_target():
             'agent': 'recon'
         }
         db.collection('scans').document(scan_id).set(scan_doc)
-        
+
         # Perform Nmap scan
         nm = nmap.PortScanner()
         if scan_type == 'basic':
@@ -92,18 +63,10 @@ def scan_target():
             scan_args = '-sV -sC -O -A --script vuln'
         else:
             scan_args = '-sV --top-ports 100'
-        
+
         logger.info(f"Running nmap scan with args: {scan_args}")
-        try:
-            nm.scan(target, arguments=scan_args)
-        except Exception as scan_err:
-            logger.error(f"Nmap scan failed: {str(scan_err)}")
-            db.collection('scans').document(scan_id).update({
-                'status': 'failed',
-                'error': str(scan_err)
-            })
-            return jsonify({"error": f"Nmap scan failed: {str(scan_err)}"}), 500
-        
+        scan_result = nm.scan(target, arguments=scan_args)
+
         # Process results and extract hypotheses
         hypotheses = []
         for host in nm.all_hosts():
@@ -112,7 +75,7 @@ def scan_target():
                 'state': nm[host].state(),
                 'protocols': list(nm[host].all_protocols())
             }
-            
+
             for proto in nm[host].all_protocols():
                 ports = nm[host][proto].keys()
                 for port in ports:
@@ -131,13 +94,12 @@ def scan_target():
                             'timestamp': datetime.utcnow().isoformat()
                         }
                         hypotheses.append(hypothesis)
-        
+
         # Upload full scan results to Storage
         scan_filename = f"recon/{scan_id}/{target}_scan.xml"
         blob = bucket.blob(scan_filename)
-        # BUG FIX: changed get_nmap_last_output() to xml_output()
-        blob.upload_from_string(nm.xml_output())
-        
+        blob.upload_from_string(nm.get_nmap_last_output())
+
         # Update scan document
         db.collection('scans').document(scan_id).update({
             'status': 'completed',
@@ -145,25 +107,22 @@ def scan_target():
             'artifact_path': scan_filename,
             'completion_timestamp': firestore.SERVER_TIMESTAMP
         })
-        
+
         # Publish hypotheses to Pub/Sub
         for hypothesis in hypotheses:
             message_data = json.dumps(hypothesis).encode('utf-8')
-            try:
-                publisher.publish(recon_topic, message_data)
-                logger.info(f"Published hypothesis for {hypothesis['target']}:{hypothesis['port']}")
-            except Exception as pub_err:
-                logger.error(f"Failed to publish hypothesis: {str(pub_err)}")
-        
+            future = publisher.publish(recon_topic, message_data)
+            logger.info(f"Published hypothesis for {hypothesis['target']}:{hypothesis['port']}")
+
         logger.info(f"Recon scan completed. Generated {len(hypotheses)} hypotheses")
-        
+
         return jsonify({
             'scan_id': scan_id,
             'target': target,
             'hypotheses_generated': len(hypotheses),
             'status': "completed"
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Error in recon scan: {str(e)}")
         return jsonify({"error": str(e)}), 500
